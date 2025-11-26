@@ -1,13 +1,12 @@
-# ======================================================
-# DAY 4: TEACH-THE-TUTOR (CODING EDITION)
-# Features: Variables, Loops, Active Recall
-# ======================================================
-
 import logging
 import json
 import os
-from typing import Annotated, Literal, Optional
-from dataclasses import dataclass
+import asyncio
+from datetime import datetime
+from typing import Annotated, Literal, Optional, List
+from dataclasses import dataclass, asdict
+
+
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -23,192 +22,216 @@ from livekit.agents import (
     RunContext,
 )
 
+# 🔌 PLUGINS
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
-# ======================================================
-# CONTENT FILE
-# ======================================================
 
-CONTENT_FILE = "coding_content.json"
 
-DEFAULT_CONTENT = [
+FAQ_FILE = "day5_sdr_content.json"
+LEADS_FILE = "leads_collected.json"
+
+
+
+DEFAULT_FAQ = [
     {
-        "id": "variables",
-        "title": "Variables",
-        "summary": "Variables store values so you can reuse them later. They have a name (identifier) and a value. You can assign, read, and update them.",
-        "sample_question": "What is a variable and why is it useful?"
+        "question": "What does Razorpay do?",
+        "answer": "Razorpay is India's leading full-stack payments platform. It allows businesses to accept payments online through UPI, cards, netbanking, wallets, and EMI options."
     },
     {
-        "id": "loops",
-        "title": "Loops",
-        "summary": "Loops let you repeat an action multiple times. A for-loop iterates over a known range or collection; a while-loop repeats until a condition changes.",
-        "sample_question": "Explain the difference between a for loop and a while loop."
+        "question": "Do you support international payments?",
+        "answer": "Yes. Razorpay supports international payments and multi-currency invoicing for eligible businesses once activated."
+    },
+    {
+        "question": "What is your pricing?",
+        "answer": "Razorpay charges a standard transaction fee depending on the payment method. UPI starts at 0% for some categories, and card payments typically range around 2%. Enterprise pricing is also available."
+    },
+    {
+        "question": "Do you offer subscriptions or recurring payments?",
+        "answer": "Yes. Razorpay Subscriptions allows automated recurring payments using cards, UPI AutoPay, and eNACH."
+    },
+    {
+        "question": "Is Razorpay secure?",
+        "answer": "Razorpay is PCI DSS Level 1 compliant and uses advanced fraud detection, strong encryption, and secure tokenization for all transactions."
+    },
+    {
+        "question": "Can I generate invoices?",
+        "answer": "Yes. Razorpay invoices let you send payment links with GST, partial payments, reminders, and automated reconcilation."
+    },
+    {
+        "question": "Do you support payouts?",
+        "answer": "Yes. RazorpayX allows businesses to automate vendor payouts, salary disbursements, refunds, and reimbursements at scale."
     }
 ]
 
 
-def load_content():
-    """Generate JSON file if missing, otherwise load it."""
+def load_knowledge_base():
+    """Generates FAQ file if missing, then loads it."""
     try:
-        path = os.path.join(os.path.dirname(__file__), CONTENT_FILE)
-
+        path = os.path.join(os.path.dirname(__file__), FAQ_FILE)
         if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONTENT, f, indent=4)
-
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
+            with open(path, "w", encoding='utf-8') as f:
+                json.dump(DEFAULT_FAQ, f, indent=4)
+        with open(path, "r", encoding='utf-8') as f:
+            return json.dumps(json.load(f)) # Return as string for the Prompt
     except Exception as e:
-        print(f"Error loading content file: {e}")
-        return []
+        print(f"⚠️ Error loading FAQ: {e}")
+        return ""
+
+STORE_FAQ_TEXT = load_knowledge_base()
 
 
-COURSE_CONTENT = load_content()
-
-# ======================================================
-# STATE MANAGEMENT
-# ======================================================
 
 @dataclass
-class TutorState:
-    current_topic_id: str | None = None
-    current_topic_data: dict | None = None
-    mode: Literal["learn", "quiz", "teach_back"] = "learn"
-
-    def set_topic(self, topic_id: str):
-        topic = next((item for item in COURSE_CONTENT if item["id"] == topic_id), None)
-        if topic:
-            self.current_topic_id = topic_id
-            self.current_topic_data = topic
-            return True
-        return False
-
+class LeadProfile:
+    name: str | None = None
+    company: str | None = None
+    email: str | None = None
+    role: str | None = None
+    use_case: str | None = None
+    team_size: str | None = None
+    timeline: str | None = None
+   
+    def is_qualified(self):
+        """Returns True if we have the minimum info (Name + Email + Use Case)"""
+        return all([self.name, self.email, self.use_case])
 
 @dataclass
 class Userdata:
-    tutor_state: TutorState
-    agent_session: Optional[AgentSession] = None
+    lead_profile: LeadProfile
 
-# ======================================================
-# TOOLS
-# ======================================================
-
-@function_tool
-async def select_topic(
-    ctx: RunContext[Userdata],
-    topic_id: Annotated[str, Field(description="Topic ID (variables, loops)")]
-) -> str:
-    state = ctx.userdata.tutor_state
-    success = state.set_topic(topic_id.lower())
-
-    if success:
-        return f"Topic set to {state.current_topic_data['title']}. Ask if the user wants to Learn, take a Quiz, or Teach Back."
-    else:
-        available = ", ".join([t["id"] for t in COURSE_CONTENT])
-        return f"Invalid topic. Available topics: {available}"
 
 
 @function_tool
-async def set_learning_mode(
+async def update_lead_profile(
     ctx: RunContext[Userdata],
-    mode: Annotated[str, Field(description="learn, quiz, teach_back")]
+    name: Annotated[Optional[str], Field(description="Customer's name")] = None,
+    company: Annotated[Optional[str], Field(description="Customer's company name")] = None,
+    email: Annotated[Optional[str], Field(description="Customer's email address")] = None,
+    role: Annotated[Optional[str], Field(description="Customer's job title")] = None,
+    use_case: Annotated[Optional[str], Field(description="What they want to build or learn")] = None,
+    team_size: Annotated[Optional[str], Field(description="Number of people in their team")] = None,
+    timeline: Annotated[Optional[str], Field(description="When they want to start (e.g., Now, next month)")] = None,
 ) -> str:
-    state = ctx.userdata.tutor_state
-    state.mode = mode.lower()
-
-    agent_session = ctx.userdata.agent_session
-
-    if agent_session:
-        if state.mode == "learn":
-            agent_session.tts.update_options(voice="en-US-matthew", style="Promo")
-            instruction = f"Explain: {state.current_topic_data['summary']}"
-
-        elif state.mode == "quiz":
-            agent_session.tts.update_options(voice="en-US-alicia", style="Conversational")
-            instruction = f"Ask: {state.current_topic_data['sample_question']}"
-
-        elif state.mode == "teach_back":
-            agent_session.tts.update_options(voice="en-US-ken", style="Promo")
-            instruction = "Ask the user to explain the concept in their own words."
-
-        else:
-            return "Invalid mode."
-
-    else:
-        instruction = "Session not found."
-
-    return f"Switched to {state.mode}. {instruction}"
-
+    
+    profile = ctx.userdata.lead_profile
+   
+    
+    if name: profile.name = name
+    if company: profile.company = company
+    if email: profile.email = email
+    if role: profile.role = role
+    if use_case: profile.use_case = use_case
+    if team_size: profile.team_size = team_size
+    if timeline: profile.timeline = timeline
+   
+    print(f"📝 UPDATING LEAD: {profile}")
+    return "Lead profile updated. Continue the conversation."
 
 @function_tool
-async def evaluate_teaching(
+async def submit_lead_and_end(
     ctx: RunContext[Userdata],
-    user_explanation: Annotated[str, Field(description="User's explanation")]
 ) -> str:
-    return "Evaluate the explanation, score out of 10, and correct misunderstandings."
+    """
+    💾 Saves the lead to the database and signals the end of the call.
+    Call this when the user says goodbye or 'that's all'.
+    """
+    profile = ctx.userdata.lead_profile
+   
+    # Save to JSON file (Append mode)
+    db_path = os.path.join(os.path.dirname(__file__), LEADS_FILE)
+   
+    entry = asdict(profile)
+    entry["timestamp"] = datetime.now().isoformat()
+   
+    # Read existing, append, write back (Simple JSON DB)
+    existing_data = []
+    if os.path.exists(db_path):
+        try:
+            with open(db_path, "r") as f:
+                existing_data = json.load(f)
+        except: pass
+   
+    existing_data.append(entry)
+   
+    with open(db_path, "w") as f:
+        json.dump(existing_data, f, indent=4)
+       
+    print(f"✅ LEAD SAVED TO {LEADS_FILE}")
+    return f"Lead saved. Summarize the call for the user: 'Thanks {profile.name}, I have your info regarding {profile.use_case}. We will email you at {profile.email}. Goodbye!'"
 
 # ======================================================
-# AGENT
+# 🧠 4. AGENT DEFINITION
 # ======================================================
 
-class TutorAgent(Agent):
+class SDRAgent(Agent):
     def __init__(self):
-        topic_list = ", ".join([f"{t['id']} ({t['title']})" for t in COURSE_CONTENT])
-
         super().__init__(
             instructions=f"""
-            You are a programming tutor for Day 4 (Teach-the-Tutor).
-
-            Topics available: {topic_list}
-
-            Modes:
-            - LEARN (Voice: Matthew): Explain the topic.
-            - QUIZ (Voice: Alicia): Ask the quiz question.
-            - TEACH_BACK (Voice: Ken): Ask the user to teach it back.
-
-            Behavior:
-            - First, ask which topic the user wants to study.
-            - Use tools immediately when the user asks to switch mode.
-            - In teach_back mode, call evaluate_teaching after the user explains.
+            You are 'Sarah', a friendly and professional Sales Development Rep (SDR) for Razorpay.
+           
+            📘 **YOUR KNOWLEDGE BASE (FAQ):**
+            {STORE_FAQ_TEXT}
+           
+            🎯 **YOUR GOAL:**
+            1. Answer questions about Razorpay’s payment solutions, onboarding, pricing, and features using the FAQ.
+            2. **QUALIFY THE LEAD:** Naturally ask for the following details during the chat:
+               - Name
+               - Company / Role
+               - Email
+               - What they want to use Razorpay for (Use Case)
+               - Timeline (When they need to get started)
+           
+            ⚙️ **BEHAVIOR:**
+            - **Be Conversational:** Don't interrogate the user. Answer a question, THEN ask for a detail.
+            - *Example:* "Razorpay supports UPI, cards, EMI, and subscriptions. By the way, how large is your team?"
+            - **Capture Data:** Use `update_lead_profile` immediately when you hear new info.
+            - **Closing:** When the user is done, use `submit_lead_and_end`.
+           
+            🚫 **RESTRICTIONS:**
+            - If you don't know an answer, say "I'll check with the Razorpay team and email you." (Don't hallucinate pricing or features).
             """,
-            tools=[select_topic, set_learning_mode, evaluate_teaching],
+            tools=[update_lead_profile, submit_lead_and_end],
         )
 
+        
+
 # ======================================================
-# ENTRYPOINT
+# 🎬 ENTRYPOINT
 # ======================================================
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
-
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    userdata = Userdata(tutor_state=TutorState())
+    print("\n" + "💼" * 25)
+    print("🚀 STARTING SDR SESSION")
+   
+    # 1. Initialize State
+    userdata = Userdata(lead_profile=LeadProfile())
 
+    # 2. Setup Agent
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Promo",
+            voice="en-US-natalie", # Professional, warm female voice
+            style="Promo",        
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         userdata=userdata,
     )
-
-    userdata.agent_session = session
-
+   
+    # 3. Start
     await session.start(
-        agent=TutorAgent(),
+        agent=SDRAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
@@ -216,7 +239,6 @@ async def entrypoint(ctx: JobContext):
     )
 
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
